@@ -7,6 +7,7 @@ import {
   ArrowUpNarrowWideIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  DownloadIcon,
   EraserIcon,
   FilterXIcon,
   ListChecksIcon,
@@ -14,11 +15,14 @@ import {
   RadioTowerIcon,
   SearchIcon,
   Trash2Icon,
+  UploadIcon,
+  XIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import { HttpCodeBlock } from "@/components/http-code-block";
 import { LinkTrafficDialog } from "@/components/link-traffic-dialog";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -42,42 +46,19 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
+import { formatBytes, formatShortDateTime } from "@/lib/format";
 import { setVisibleInterval } from "@/lib/polling";
 import { useStoredSortPreference } from "@/lib/sort-preference";
-import type { TrafficDetail, TrafficExchange, TrafficHost, TrafficResp } from "@/lib/types";
+import { httpStatusTone } from "@/lib/status";
+import type { TrafficDetail, TrafficExchange, TrafficHARImportResult, TrafficHost, TrafficResp } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { intlLocale, t } from "@/i18n";
+import { useActiveCompanyID } from "@/stores/company/company-store";
+import { t } from "@/i18n";
 
 import { ReplayPanel } from "./_components/replay-panel";
 import { StreamMessagesPanel } from "./_components/stream-messages";
+import { TamperHooksPanel } from "./_components/tamper-hooks-panel";
 
-function fmtTime(ts: string) {
-  return new Date(ts).toLocaleString(intlLocale, {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
-
-function fmtBytes(n: number) {
-  if (n <= 0) return "0 B";
-  // GB matters for the reclaimed-space figure a full purge reports; a capture-heavy
-  // instance can hand back several.
-  const units = ["B", "KB", "MB", "GB"];
-  const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), units.length - 1);
-  const v = n / 1024 ** i;
-  return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
-}
-
-function statusTone(status: number) {
-  if (status >= 500) return "text-red-500";
-  if (status >= 400) return "text-amber-500";
-  if (status >= 300) return "text-blue-500";
-  if (status >= 200) return "text-emerald-500";
-  return "text-muted-foreground";
-}
 
 function MethodBadge({ method }: { method: string }) {
   return <Badge className="shrink-0 font-mono">{method}</Badge>;
@@ -117,6 +98,9 @@ const SORT_STORAGE_KEY = "traffic-sort";
 const STATUS_BUCKETS = ["2xx", "3xx", "4xx", "5xx"];
 
 export default function TrafficPage() {
+  const [viewTab, setViewTab] = React.useState<"exchanges" | "hooks">("exchanges");
+  // The sidebar's company switcher narrows the list to that company's hosts.
+  const companyId = useActiveCompanyID();
   const [selectedFlows, setSelectedFlows] = React.useState<Set<string>>(() => new Set());
   const [linking, setLinking] = React.useState(false);
   const [page, setPage] = React.useState(0);
@@ -158,6 +142,13 @@ export default function TrafficPage() {
   const [deleteMode, setDeleteMode] = React.useState<"filter" | "selected" | "all" | null>(null); // null = dialog closed
   const [deleting, setDeleting] = React.useState(false);
   const [reloadTick, setReloadTick] = React.useState(0); // manual refetch trigger
+
+  // HAR 1.2 import/export state
+  const harInputRef = React.useRef<HTMLInputElement | null>(null);
+  const [harImporting, setHarImporting] = React.useState(false);
+  const [harExporting, setHarExporting] = React.useState(false);
+  const [harSummary, setHarSummary] = React.useState<TrafficHARImportResult | null>(null);
+  const [harError, setHarError] = React.useState<string | null>(null);
 
   // Debounce both filters so we don't refetch on every keystroke.
   React.useEffect(() => {
@@ -204,7 +195,7 @@ export default function TrafficPage() {
   // biome-ignore lint/correctness/useExhaustiveDependencies: these values intentionally trigger a page reset.
   React.useEffect(() => {
     setPage(0);
-  }, [hostQ, queryQ, method, size, bodyQ, pathQ, statusFilter, rewrittenFilter, respMinQ, respMaxQ, sort]);
+  }, [hostQ, queryQ, method, size, bodyQ, pathQ, statusFilter, rewrittenFilter, respMinQ, respMaxQ, sort, companyId]);
 
   // Load the current page. Auto-refresh only on page 0 (newest) so paging back
   // through history isn't yanked out from under the user.
@@ -222,6 +213,7 @@ export default function TrafficPage() {
           respMax: respMaxQ,
           sort: sort.field,
           order: sort.direction,
+          company: companyId,
         })
         .then((r) => {
           if (alive) setTraffic(r);
@@ -261,6 +253,7 @@ export default function TrafficPage() {
     respMaxQ,
     sort,
     reloadTick,
+    companyId,
   ]);
 
   // Delete traffic for the current host filter (substring) or the checked
@@ -314,7 +307,7 @@ export default function TrafficPage() {
             reclaimed > 0
               ? t("Purged {count} traffic records, freeing {size} of storage", {
                   count: r.deleted,
-                  size: fmtBytes(reclaimed),
+                  size: formatBytes(reclaimed),
                 })
               : t("Purged {count} traffic records", { count: r.deleted }),
           );
@@ -367,6 +360,76 @@ export default function TrafficPage() {
         : { field, direction: "desc" },
     );
 
+  const handleHarFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setHarError(null);
+    setHarSummary(null);
+    if (file.size > 32 * 1024 * 1024) {
+      const msg = t("HAR file exceeds the 32 MiB limit");
+      setHarError(msg);
+      toast.error(msg);
+      return;
+    }
+    setHarImporting(true);
+    try {
+      const raw = await file.text();
+      const res = await api.trafficImportHAR(raw);
+      setHarSummary(res);
+      const summary = t("HAR import complete: {imported} imported, {skipped} skipped, {failed} failed", {
+        imported: res.imported,
+        skipped: res.skipped,
+        failed: res.failed,
+      });
+      if (res.failed > 0 || res.truncated) {
+        toast.warning(summary);
+      } else {
+        toast.success(summary);
+      }
+      setPage(0);
+      setReloadTick((n) => n + 1);
+    } catch (e) {
+      const msg = t("HAR import failed: {error}", { error: (e as Error).message });
+      setHarError(msg);
+      toast.error(msg);
+    } finally {
+      setHarImporting(false);
+    }
+  };
+
+  const handleHarExport = async () => {
+    setHarExporting(true);
+    try {
+      const meta = await api.trafficExportHAR({
+        host: hostQ,
+        method,
+        q: queryQ,
+        body: bodyQ,
+        path: pathQ,
+        status: statusFilter,
+        rewritten: rewrittenFilter,
+        respMin: respMinQ,
+        respMax: respMaxQ,
+      });
+      if (meta.truncated) {
+        toast.warning(
+          t("Exported {exported} of {matched} matching exchanges (truncated: {reason})", {
+            exported: meta.exported,
+            matched: meta.matched,
+            reason: meta.truncatedReason ?? "limit",
+          }),
+        );
+      } else {
+        toast.success(t("Exported {count} exchanges to HAR", { count: meta.exported }));
+      }
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setHarExporting(false);
+    }
+  };
+
   const exchanges = React.useMemo(() => traffic?.exchanges ?? [], [traffic]);
   const total = traffic?.total ?? exchanges.length;
   const pageCount = Math.max(1, Math.ceil(total / size));
@@ -396,8 +459,91 @@ export default function TrafficPage() {
           <span className="text-xs text-muted-foreground tabular-nums">
             {t("{count} records", { count: traffic?.count ?? 0 })}
           </span>
+          <input
+            ref={harInputRef}
+            type="file"
+            accept=".har,application/json"
+            className="hidden"
+            onChange={(e) => void handleHarFileChange(e)}
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8"
+            disabled={harImporting}
+            onClick={() => harInputRef.current?.click()}
+          >
+            {harImporting ? <Loader2Icon className="size-3.5 animate-spin" /> : <UploadIcon className="size-3.5" />}
+            {harImporting ? t("Importing HAR…") : t("Import HAR")}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8"
+            disabled={harExporting || !traffic?.count}
+            onClick={() => void handleHarExport()}
+          >
+            {harExporting ? <Loader2Icon className="size-3.5 animate-spin" /> : <DownloadIcon className="size-3.5" />}
+            {harExporting ? t("Exporting HAR…") : t("Export HAR")}
+          </Button>
         </div>
       </div>
+
+      <Tabs
+        value={viewTab}
+        onValueChange={(v) => setViewTab(v as "exchanges" | "hooks")}
+        className="flex min-h-0 flex-1 flex-col gap-4"
+      >
+        <TabsList className="w-fit">
+          <TabsTrigger value="exchanges">{t("Exchanges")}</TabsTrigger>
+          <TabsTrigger value="hooks">{t("Hooks")}</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="hooks" className="mt-0 flex min-h-0 flex-1 flex-col gap-4">
+          <TamperHooksPanel recentExchanges={exchanges} />
+        </TabsContent>
+
+        <TabsContent value="exchanges" className="mt-0 flex min-h-0 flex-1 flex-col gap-4">
+
+      {harError ? (
+        <Alert variant="destructive" className="flex items-center justify-between gap-2 py-2">
+          <AlertDescription className="text-xs">{harError}</AlertDescription>
+          <Button variant="ghost" size="icon-xs" aria-label={t("Dismiss")} onClick={() => setHarError(null)}>
+            <XIcon className="size-3.5" />
+          </Button>
+        </Alert>
+      ) : null}
+
+      {harSummary ? (
+        <Alert className="flex items-start justify-between gap-2 py-2">
+          <AlertDescription className="space-y-1 text-xs">
+            <p>
+              {t("HAR import complete: {imported} imported, {skipped} skipped, {failed} failed", {
+                imported: harSummary.imported,
+                skipped: harSummary.skipped,
+                failed: harSummary.failed,
+              })}
+            </p>
+            {harSummary.truncated ? (
+              <p className="text-amber-600 dark:text-amber-400">
+                {t("HAR import stopped early at the 32 MiB decoded body cap.")}
+              </p>
+            ) : null}
+            {harSummary.errors && harSummary.errors.length > 0 ? (
+              <ul className="list-disc pl-4 text-muted-foreground">
+                {harSummary.errors.slice(0, 5).map((item) => (
+                  <li key={`${item.index}-${item.reason}`} className="font-mono">
+                    #{item.index}: {item.reason}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </AlertDescription>
+          <Button variant="ghost" size="icon-xs" aria-label={t("Dismiss")} onClick={() => setHarSummary(null)}>
+            <XIcon className="size-3.5" />
+          </Button>
+        </Alert>
+      ) : null}
 
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2">
@@ -743,7 +889,9 @@ export default function TrafficPage() {
                         }
                       />
                     </TableCell>
-                    <TableCell className="text-xs text-muted-foreground tabular-nums">{fmtTime(e.ts)}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground tabular-nums">
+                      {formatShortDateTime(e.ts)}
+                    </TableCell>
                     <TableCell className="font-mono text-xs">{e.host}</TableCell>
                     <TableCell>
                       <MethodBadge method={e.method} />
@@ -762,12 +910,14 @@ export default function TrafficPage() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <span className={cn("font-mono text-xs font-semibold tabular-nums", statusTone(e.status))}>
+                      <span
+                        className={cn("font-mono text-xs font-semibold tabular-nums", httpStatusTone(e.status))}
+                      >
                         {e.status}
                       </span>
                     </TableCell>
                     <TableCell className="text-xs text-muted-foreground">{e.content_type}</TableCell>
-                    <TableCell className="text-right text-xs tabular-nums">{fmtBytes(e.resp_len)}</TableCell>
+                    <TableCell className="text-right text-xs tabular-nums">{formatBytes(e.resp_len)}</TableCell>
                   </TableRow>
                 ))}
                 {exchanges.length === 0 && (
@@ -797,7 +947,10 @@ export default function TrafficPage() {
               <SheetHeader className="border-b px-5 py-4">
                 <div className="flex items-center gap-2 pr-8">
                   <MethodBadge method={selected.method} />
-                  <Badge variant="secondary" className={cn("font-mono tabular-nums", statusTone(selected.status))}>
+                  <Badge
+                    variant="secondary"
+                    className={cn("font-mono tabular-nums", httpStatusTone(selected.status))}
+                  >
                     {selected.status}
                   </Badge>
                   {selected.rewritten ? (
@@ -808,7 +961,9 @@ export default function TrafficPage() {
                       {t("Rewritten")}
                     </Badge>
                   ) : null}
-                  <span className="ml-auto text-xs text-muted-foreground tabular-nums">{fmtTime(selected.ts)}</span>
+                  <span className="ml-auto text-xs text-muted-foreground tabular-nums">
+                    {formatShortDateTime(selected.ts)}
+                  </span>
                 </div>
                 <SheetTitle className="break-all font-mono">{selected.host}</SheetTitle>
                 <SheetDescription className="break-all font-mono">{selected.url}</SheetDescription>
@@ -950,6 +1105,8 @@ export default function TrafficPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }
